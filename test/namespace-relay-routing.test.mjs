@@ -1998,11 +1998,17 @@ function goCompatibilityRequestPayload(
       { type: "function_call_output", call_id: "history-discovered", output: "done" },
       {
         type: "custom_tool_call",
+        id: "ctc_history_patch",
         name: "apply_patch",
         call_id: "history-patch",
         input: GO_PATCH,
       },
-      { type: "custom_tool_call_output", call_id: "history-patch", output: "Done!" },
+      {
+        type: "custom_tool_call_output",
+        id: "ctco_history_patch",
+        call_id: "history-patch",
+        output: "Done!",
+      },
       {
         type: "custom_tool_call",
         name: "future_custom",
@@ -2143,6 +2149,14 @@ test("OpenCode Go Responses uses one bounded function-tool contract in both resp
       outgoing.input.find((item) => item.call_id === "history-patch").type,
       "function_call",
     );
+    const patchCall = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call",
+    );
+    const patchOutput = outgoing.input.find(
+      (item) => item.call_id === "history-patch" && item.type === "function_call_output",
+    );
+    assert.equal(Object.hasOwn(patchCall, "id"), false);
+    assert.equal(Object.hasOwn(patchOutput, "id"), false);
     const futureCustom = outgoing.input.find(
       (item) => item.call_id === "history-future-custom" && item.type === "function_call",
     );
@@ -2492,7 +2506,7 @@ test("Grok structured patch opt-in crosses the real Router with collision, choic
     assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
     const old = outgoing.input.find((item) => item.call_id === "call_history");
     assert.equal(old.name, tool.name);
-    assert.equal(old.id, "ctc_history");
+    assert.equal(Object.hasOwn(old, "id"), false);
     assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
     assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });
     const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
@@ -2832,10 +2846,36 @@ test("hy4's prior reasoning is replayed as thinking, never as its own visible pr
     );
   }
 
-  // A chat route with no thinking contract keeps the old shape: reasoning is
-  // merged as text, since LiteLLM would otherwise drop it.
+  // A chat route outside the contract now DROPS the prior reasoning instead of
+  // merging it as visible text. This assertion is the reverse of what it was,
+  // and the reversal is deliberate (#755).
+  //
+  // The old expectation was written to preserve context that LiteLLM would
+  // otherwise drop, and for a model that does not preserve thinking -- k2.6 is
+  // exactly that, which is why chat-reasoning.mjs leaves K2.x out of the
+  // family table -- the merge was harmless. What changed is upstream of this
+  // file: #708 widened the reasoning-lifecycle repair to every
+  // `openai`-protocol provider, so Codex now stores reasoning items on Chat
+  // resellers whose models DO think and are still outside the contract
+  // (`commandcode/qwen3.8-flash`, measured 14 September 2026). Replayed as
+  // prose those loop, and no field on the route separates them from k2.6 here
+  // -- identical requestProfile, reasoningLevels and defaultEffort -- so the
+  // channel is chosen per contract, not per model.
+  //
+  // The cost is real and was accepted rather than overlooked: a thread that
+  // switched models no longer shows the newer model the older one's thinking.
+  // For a model that does not think, that is the only case this can arise in
+  // at all, since it stores no reasoning of its own to carry.
   const plain = await outgoingFor("opencode-go/kimi-k2.6");
   const plainAssistant = plain.input.find((item) => item.type === "message" && item.role === "assistant");
-  assert.equal(plainAssistant.content[0].type, "output_text");
-  assert.equal(plainAssistant.content[0].text, "PRIOR_THINKING: look at the locomotion code first.");
+  assert.deepEqual(
+    plainAssistant.content.map((part) => `${part.type}:${part.text}`),
+    ["output_text:Let me read the locomotion code."],
+    "an off-contract route keeps what the model said and drops what it thought",
+  );
+  assert.equal(
+    plain.input.some((item) => item.type === "reasoning"),
+    false,
+    "the dropped reasoning must not survive as an item either",
+  );
 });

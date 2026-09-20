@@ -41,7 +41,9 @@ native traffic does not traverse the LiteLLM gateway.
   timestamp assertions were updated for the new log prefix.
 - Extended real-process integration closes the listener while keeping the
   gateway alive, then verifies replacement and termination of its old PID.
-- Repository syntax/consistency checks and whitespace validation.
+- Fork-main integration: 68 affected Node tests and both Python tests passed,
+  including main's fatal-exit diagnostics. Repository syntax/consistency
+  checks and whitespace validation passed in both checkouts.
 - Controlled live failure at 17:37:21 UTC: gateway ready at 17:37:32 UTC;
   a Responses request submitted during unavailability completed HTTP 200 in
   13.661 seconds. Router PID 22956 remained unchanged.

@@ -285,6 +285,7 @@ Linux installations support the Codex CLI.
 | DeepSeek V4 Pro (Qwen Plan) | `qwen-plan/deepseek-v4-pro` | Alibaba Model Studio plan API key |
 | DeepSeek V4 Flash (Qwen Plan) | `qwen-plan/deepseek-v4-flash-0731` | Alibaba Model Studio plan API key |
 | GLM-5.2 (Qwen Plan) | `qwen-plan/glm-5.2` | Alibaba Model Studio plan API key |
+| GLM-5.3-Flash (Coding Plan) | `zai-coding/glm-5.3-flash` | Z.ai GLM Coding Plan API key |
 | GLM-5.3 (Coding Plan) | `zai-coding/glm-5.3` | Z.ai GLM Coding Plan API key |
 | GLM-5.2 (Coding Plan) | `zai-coding/glm-5.2` | Z.ai GLM Coding Plan API key |
 | GLM-5-Turbo (Coding Plan) | `zai-coding/glm-5-turbo` | Z.ai GLM Coding Plan API key |
@@ -300,9 +301,12 @@ Linux installations support the Codex CLI.
 | Hy4 Preview (NanoGPT) | `nano-gpt/tencent/hy4-preview` | NanoGPT API key |
 | Hy4 Preview (Nous Research) | `nousresearch/tencent/hy4-preview` | Nous Portal API key |
 | Hy4 Preview (opencode Go) | `opencode-go/hy4-preview` | opencode Go/Zen API key |
+| Union Alpha (opencode Go) | `opencode-go-messages/union-alpha` | opencode Go/Zen API key |
+| Union Alpha (OpenRouter) | `openrouter/union-alpha` | OpenRouter API key |
 | Hy4 Preview (OpenRouter) | `openrouter/tencent/hy4-preview` | OpenRouter API key |
 | GLM-5.2 (ClinePass) | `clinepass/glm-5.2` | ClinePass API key |
 | Kimi K3 (ClinePass) | `clinepass/kimi-k3` | ClinePass API key |
+| Kimi K3 (ainetcafe) | `ainetcafe/kimi-k3` | ainetcafe API key (`AINETCAFE_API_KEY`) |
 | Kimi K2.7 Code (ClinePass) | `clinepass/kimi-k2.7-code` | ClinePass API key |
 | Kimi K2.6 (ClinePass) | `clinepass/kimi-k2.6` | ClinePass API key |
 | DeepSeek V4 Pro (ClinePass) | `clinepass/deepseek-v4-pro` | ClinePass API key |
@@ -596,6 +600,15 @@ forced choice for that model only (`--request-profile auto-tool-choice` in the
 ./bin/curate-models PROVIDER --models MODEL_ID --request-profile auto-tool-choice
 ```
 
+Vertex also has an explicit offline mode for accounts where Model Garden's
+publisher-model list is unavailable: `./bin/curate-models vertex --static --models MODEL_ID`.
+This uses only the reviewed entries in
+`config/vertex/support-catalog.json`, never silently falls back after a live
+discovery failure, and still requires working ADC, Vertex API enablement, IAM,
+and model access when a request is sent. `--static` cannot be combined with
+`--refresh`; it is a curation escape hatch, not proof that the account can use
+every reviewed model.
+
 For an already-curated model, edit only that entry's `requestProfile` in the
 protected `user-models.json`, preserving its existing context, modalities,
 efforts, and other hand-tuned metadata; do not remove and re-add it or apply a
@@ -706,6 +719,7 @@ the operator explicitly selects them.
 | MiMo-V2.5-Pro (opencode Go) | `opencode-go/mimo-v2.5-pro` |
 | Hy3 (opencode Go) | `opencode-go/hy3` |
 | Hy4 Preview (opencode Go) | `opencode-go/hy4-preview` |
+| Union Alpha (opencode Go) | `opencode-go-messages/union-alpha` |
 | MiniMax M3 (opencode Go) | `opencode-go-messages/minimax-m3` |
 | MiniMax M2.7 (opencode Go) | `opencode-go-messages/minimax-m2.7` |
 | MiniMax M2.5 (opencode Go) | `opencode-go-messages/minimax-m2.5` |
@@ -918,6 +932,7 @@ Coding, and the Z.ai API route is shipped with the same direct-proven ladder.
 | ~~Ox Alpha (Venice)~~ | `venice/ox-alpha` | ~~Venice~~ | Not shipped — wire verification was billing-blocked |
 | ~~Ox Alpha (OpenCode Free)~~ | `opencode-free/ox-alpha` | ~~no~~ | Withdrawn |
 | GLM-5.3-Flash (opencode Go) | `opencode-go/glm-5.3-flash` | opencode | Named replacement |
+| GLM-5.3-Flash (Command Code) | `commandcode/glm-5.3-flash` | Command Code | Available — catalog-pinned, no exact-route run recorded |
 | GLM-5.3-Flash (OpenRouter) | `openrouter/glm-5.3-flash` | OpenRouter | Available |
 | GLM-5.3-Flash (Z.ai API) | `zai-api/glm-5.3-flash` | Z.ai API | Available |
 | GLM-5.3-Flash (Z.ai Coding) | `zai-coding/glm-5.3-flash` | Z.ai Coding | Available |
@@ -947,11 +962,30 @@ curated `opencode-go/ox-alpha-free` selections migrate to
 `opencode-go/glm-5.3-flash` automatically.
 
 The picker retains OpenCode Go's advertised 1M context, but Codex compacts this
-route at 400K. In live multimodal tasks, larger Flash histories repeatedly
-returned empty completions before the advertised limit; the conservative
-threshold avoids presenting those blank turns as usable context. OpenCode Go's
+route — and every other GLM-5.3-Flash route, whichever provider serves it — at
+400K. In live multimodal tasks, larger Flash histories repeatedly returned
+empty completions before the advertised limit; the conservative threshold
+avoids presenting those blank turns as usable context. OpenCode Go's
 content moderation still applies to the compaction request itself, so a
 sensitive transcript may be rejected even when the ordinary task turn worked.
+
+OpenCode Go's current stealth preview is **Union Alpha** (`union-alpha` on
+the Messages API). It is a separate model from Ox Alpha / GLM-5.3-Flash:
+OpenCode does not name the maker, documents a 262,144-token window with
+131,072 tokens of advertised output, text and image input, and currently
+lists it as free for a limited time. The Messages hop and the published
+catalog reserve the measured 32,768 completion cap. A single message whose
+content exceeds Console Go's 2,500,000-character limit (a generated ImageGen
+PNG data URL) is replaced with a labeled stub so the follow-up turn can
+finish. The shipped slug is
+`opencode-go-messages/union-alpha`. OpenRouter publishes the same preview as
+`stealth/union-alpha` (text and image input, 262,144 context, 131,072 output,
+currently free); the shipped slug is `openrouter/union-alpha`. OpenRouter's
+endpoint record accepts `tool_choice` auto only, so that route downgrades
+Codex's forced choice. It does not advertise a reasoning-effort ladder.
+ClinePass and Command Code do not list this id. Omen Alpha remains in the
+live Go catalog but is deprecated in OpenCode's models.dev record and is not
+checked in.
 
 Command Code and Venice still expose their live catalogs to explicit curation.
 An operator with an entitled account can inspect and select whatever those
@@ -1010,6 +1044,13 @@ often for the repository to pin and live-verify individual entries:
 login`, the Control Center and `./bin/curate-models devin-cli` read the model
 configuration available to that account through the installed Devin CLI; the
 provider still ships no preselected models.
+
+`vertex` is the Google Cloud exception. It uses Application Default Credentials
+from `gcloud auth application-default login` plus
+`./bin/control vertex set PROJECT_ID LOCATION`, not an API key, and it is
+never selected by a default install. After connecting, run
+`./bin/curate-models vertex`. A discovered Model Garden id is not routable
+until it is curated onto a reviewed adapter.
 
 OpenRouter, NanoGPT, Venice, and Nous Research are ordinary API-key providers with
 live-reviewed checked-in routes in the model table. Use `bin/curate-models` for

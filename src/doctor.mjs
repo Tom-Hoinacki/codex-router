@@ -473,17 +473,29 @@ try {
   requiredRoutedModels = selectedConfiguredListedModels();
   catalogRoutedModels = routedTransportActive ? requiredRoutedModels : [];
   requiredModels = new Set(catalogRoutedModels.map((model) => model.slug));
+  // Registry selection and generic providers are two lists. A Poe-only
+  // install writes `enabled-providers.json` as `[]` and still serves curated
+  // generic routes, so naming only the registry file here reported
+  // "Enabled providers: none" while the Poe row below said OK (#774).
+  const enabledGenericIds = [...RUNTIME_PROVIDERS.values()]
+    .filter((provider) => provider.generic === true && genericProviderConfigured(provider.id))
+    .map((provider) => provider.id);
+  const enabledNames = [...selection.providers, ...enabledGenericIds];
   add(
-    selection.providers.length ? "ok" : idleInstall ? "warn" : "fail",
+    enabledNames.length ? "ok" : idleInstall ? "warn" : "fail",
     "Enabled providers",
-    selection.providers.length
-      ? `${selection.providers.join(", ")}${selection.explicit ? "" : " (legacy show-all mode)"}`
+    enabledNames.length
+      ? `${enabledNames.join(", ")}${
+        selection.explicit || enabledGenericIds.length ? "" : " (legacy show-all mode)"
+      }`
       : idleInstall
         ? "none (idle install: --no-provider)"
         : "none",
-    idleInstall
-      ? "Run ./bin/setup without --no-provider to enable a provider."
-      : "Run ./bin/setup --guided and choose at least one provider.",
+    enabledNames.length
+      ? undefined
+      : idleInstall
+        ? "Run ./bin/setup without --no-provider to enable a provider."
+        : "Run ./bin/setup --guided and choose at least one provider.",
   );
   // The router no longer refuses to serve on a selection file it cannot fully
   // resolve, so the damage has to be reported here instead of as a 502.
@@ -1134,6 +1146,8 @@ for (const provider of PROVIDERS.values()) {
         ? `${provider.displayName} anonymous endpoint`
       : provider.authMode === "per-model"
         ? `${provider.displayName} per-model endpoints`
+      : provider.credential?.resolver
+        ? `${provider.displayName} credentials`
       : `${provider.displayName} ${credentialNoun}`,
     status.configured ? status.source : "not configured",
     provider.keyless
@@ -1144,7 +1158,9 @@ for (const provider of PROVIDERS.values()) {
         ? provider.anonymousNote || "No key needed; only the provider's free models are available."
       : provider.authMode === "per-model"
         ? "Each model here names its own endpoint; a model that needs a key reports it on its own row."
-      : `Run ./bin/provider-key ${provider.id} set.`,
+      : provider.credential?.resolver
+        ? status.setup || "Configure Vertex project/location and Google Application Default Credentials."
+        : `Run ./bin/provider-key ${provider.id} set.`,
   );
   // A credential that resolves says nothing about whether the account's plan
   // may use the API. Only warn once the provider is actually selected, so the

@@ -118,6 +118,13 @@ if (!selfReplacingControl && !boundedOperationChild(process.env, {
   // escalate a full process-group termination. Catalog desktop watchdogs keep
   // another ten seconds outside this boundary; shorter ordinary operations
   // retain the larger margin chosen by their UI runner.
+  //
+  // `stdio: "inherit"` is load-bearing. The default `"capture"` mode ignores
+  // stdin, so a Control Center credential write would arrive empty at the
+  // inner process. A packaged Electron parent has no console to inherit:
+  // `process-tree.mjs` then relays the three streams through pipes and keeps
+  // CREATE_NO_WINDOW. Do not switch this re-exec to capture to hide a
+  // Windows console (#775); that was the wrong layer, and it would drop keys.
   const deadline = operationDeadlineFromEnvironment(process.env, {
     timeoutMs: maximumControlOperationMs,
     maximumMs: maximumControlOperationMs,
@@ -942,6 +949,11 @@ async function readSecretFromStdin() {
 
 async function saveProviderCredential(providerId) {
   const { providerOnboardingSnapshot, saveApiCredential } = await import("./provider-onboarding.mjs");
+  const { apiProvider } = await import("./provider-credentials.mjs");
+  const provider = apiProvider(providerId);
+  if (provider.credential?.resolver) {
+    throw new Error(`${provider.displayName} does not accept API keys.`);
+  }
   const value = await readSecretFromStdin();
   // The control-center sends this command before it refreshes its provider
   // snapshot. Keep credential persistence, selection, and target publication
@@ -1086,6 +1098,35 @@ async function handleProviderKeyPool(providerId, action, value) {
       );
     }
   }
+}
+
+async function handleVertex(action, projectId, location) {
+  const {
+    clearVertexConfiguration,
+    setVertexConfiguration,
+    vertexConfigurationStatus,
+  } = await import("./vertex-state.mjs");
+  const { credentialStatus } = await import("./provider-credentials.mjs");
+  const status = () => ({
+    configuration: vertexConfigurationStatus({ persistent: true }),
+    credential: credentialStatus("vertex", { persistent: true }),
+  });
+
+  if (!action || action === "status") {
+    process.stdout.write(`${JSON.stringify(status())}\n`);
+    return;
+  }
+  if (action === "set" || action === "configure") {
+    if (!projectId || !location) {
+      throw new Error("Usage: control vertex set <project-id> <location>");
+    }
+    setVertexConfiguration({ projectId, location });
+  } else if (action === "clear") {
+    clearVertexConfiguration();
+  } else {
+    throw new Error("Usage: control vertex status|set <project-id> <location>|clear");
+  }
+  process.stdout.write(`${JSON.stringify(status())}\n`);
 }
 
 async function setLoginFreeMode(desired) {
@@ -3165,15 +3206,82 @@ async function handleClientSetup(target, publicUrl, hostname) {
 }
 
 // Removing one published client is never a reason to tear the shared plane
-// down: `bin/disable` retires the service only once `installedTargets()` is
-// empty, and this command deliberately never touches the service at all.
+// down on its own: the service is retired only once `installedTargets()` is
+// empty. Cursor is the exception that may restart the shared service so its
+// separately tunneled public-edge child does not survive after disconnect.
 async function handleClientDisconnect(target) {
   const { ROUTED_HARNESS_IDS } = await import("./routed-harness-catalog.mjs");
-  if (!ROUTED_HARNESS_IDS.includes(target)) {
-    throw new Error("Usage: control client-disconnect opencode|pi|omp|commandcode|hermes");
+  if (ROUTED_HARNESS_IDS.includes(target)) {
+    const { createRoutedHarnessManager } = await import("./routed-harness-manager.mjs");
+    process.stdout.write(`${JSON.stringify(createRoutedHarnessManager(target).uninstall())}\n`);
+    return;
   }
-  const { createRoutedHarnessManager } = await import("./routed-harness-manager.mjs");
-  process.stdout.write(`${JSON.stringify(createRoutedHarnessManager(target).uninstall())}\n`);
+
+  // Target clients share one Node uninstall path on every OS. Do not route
+  // through currentCheckoutInstaller: on Windows that always runs install.
+  const uninstallArgv = {
+    codex: ["src/config-manager.mjs", "disable"],
+    dsh: ["src/dsh-config-manager.mjs", "uninstall"],
+    gemini: ["src/gemini-config-manager.mjs", "uninstall"],
+    cursor: ["src/cursor-config-manager.mjs", "uninstall"],
+    claude: ["src/claude-code-config-manager.mjs", "uninstall"],
+    openclaw: ["src/openclaw-config-manager.mjs", "uninstall"],
+  }[target];
+  if (!uninstallArgv) {
+    throw new Error(
+      "Usage: control client-disconnect codex|dsh|gemini|cursor|claude|openclaw|opencode|pi|omp|commandcode|hermes",
+    );
+  }
+
+  const uninstall = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, uninstallArgv[0]), uninstallArgv[1]],
+    {
+      cwd: REPO_ROOT,
+      env: { ...process.env, MODEL_ROUTER_TARGET: target },
+      encoding: "utf8",
+      windowsHide: true,
+    },
+  );
+  if (uninstall.error) throw uninstall.error;
+  if (uninstall.status !== 0) {
+    throw new Error(
+      String(uninstall.stderr || uninstall.stdout || `${target} disconnect failed`).trim(),
+    );
+  }
+
+  const { installedTargets } = await import("./target-integration.mjs");
+  const remaining = installedTargets();
+  const serviceAction = remaining.length === 0
+    ? "uninstall"
+    : target === "cursor"
+      ? "install"
+      : null;
+  if (serviceAction) {
+    const service = spawnSync(
+      process.execPath,
+      [path.join(REPO_ROOT, "src", "service.mjs"), serviceAction],
+      {
+        cwd: REPO_ROOT,
+        env: process.env,
+        encoding: "utf8",
+        windowsHide: true,
+      },
+    );
+    if (service.error) throw service.error;
+    if (service.status !== 0) {
+      throw new Error(
+        String(service.stderr || service.stdout || `service ${serviceAction} failed`).trim(),
+      );
+    }
+  }
+
+  process.stdout.write(`${JSON.stringify({
+    target,
+    removed: true,
+    remaining,
+    ...(serviceAction ? { serviceAction } : {}),
+  })}\n`);
 }
 
 // Move one routed harness CLI, or all of them, to its latest release.
@@ -3458,6 +3566,8 @@ if (args.includes("--probe")) {
   await printProviderOnboarding();
 } else if (args[0] === "generic-providers") {
   await handleGenericProviders(...args.slice(1));
+} else if (args[0] === "vertex") {
+  await handleVertex(args[1] || "status", args[2], args[3]);
 } else if (args[0] === "install-cli") {
   if (!args[1]) throw new Error("Usage: control install-cli <oauth-provider>");
   await installProviderCli(args[1]);
@@ -3521,7 +3631,7 @@ if (args.includes("--probe")) {
   await handleClientSetup(args[1], publicUrl, hostname);
 } else if (args[0] === "client-disconnect") {
   if (args.length !== 2) {
-    throw new Error("Usage: control client-disconnect opencode|pi|omp|commandcode|hermes");
+    throw new Error("Usage: control client-disconnect codex|dsh|gemini|cursor|claude|openclaw|opencode|pi|omp|commandcode|hermes");
   }
   await handleClientDisconnect(args[1]);
 } else if (args[0] === "client-update") {

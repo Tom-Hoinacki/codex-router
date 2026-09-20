@@ -150,6 +150,8 @@ import {
   bridgeCustomTools,
   downgradeOriginalImageDetail,
   flattenNamespacedHistory,
+  stripUnissuedEncryptedReasoning,
+  stripUnissuedEncryptedReasoningInclude,
   flattenNamespaceTools,
   flattenToolChoice,
   flattenToolSearchHistory,
@@ -157,6 +159,7 @@ import {
   repairToolSchemaRoots,
   strictOpenCodeCompactionInput,
   stripSearchContentTypes,
+  anthropicFunctionTools,
   ToolSearchHistoryCapacityError,
 } from "./namespace-relay.mjs";
 import {
@@ -196,7 +199,18 @@ import {
   activityMetadataFromHeaders,
   threadIdFromHeaders,
 } from "./codex-session-names.mjs";
-import { gatewayErrorStatus, translateGatewayError } from "./error-translation.mjs";
+import {
+  contextLengthFailure,
+  gatewayErrorStatus,
+  translateGatewayError,
+} from "./error-translation.mjs";
+import {
+  INVALID_FUNCTION_CALL_ARGUMENTS_CODE,
+  findUnusableFunctionCallArguments,
+  historyFunctionCallArgumentsError,
+  invalidCompletedFunctionCallTransform,
+  isInvalidFunctionCallArgumentsError,
+} from "./invalid-function-call.mjs";
 import { describeTransportFailure } from "./transport-failure.mjs";
 import {
   endpointCapabilityError,
@@ -957,7 +971,22 @@ function routedResponsesTarget(route) {
 // this router hands the turn to the gateway. A profile that rejects forced
 // tool choices therefore has to be normalized here, before that translation
 // can cause the upstream model to emit an invalid forced call.
+function isNoneToolChoice(toolChoice) {
+  return toolChoice === "none"
+    || (toolChoice && typeof toolChoice === "object" && !Array.isArray(toolChoice)
+      && toolChoice.type === "none");
+}
+
 function normalizeAutoToolChoice(payload, route) {
+  if (route.requestProfile === "omit-tool-choice") {
+    // Qwen behind OpenCode Go Messages 400s the field in any form, including
+    // "auto" and "none", and calls listed tools when it is absent. Dropping
+    // "none" while leaving the tools would turn an explicit prohibition into
+    // the upstream default, so that case removes the tools as well.
+    if (isNoneToolChoice(payload.tool_choice)) delete payload.tools;
+    delete payload.tool_choice;
+    return;
+  }
   if (
     ["auto-tool-choice", "ollama-cloud-auto-tool-choice"].includes(route.requestProfile) &&
     payload.tool_choice !== undefined &&
@@ -1085,7 +1114,19 @@ function needsMoonshotSchemaCompatibility(route) {
 
 function zenFreeCompatibleInput(input, route) {
   if (!needsZenFreeToolCompatibility(route)) return input;
-  return downgradeOriginalImageDetail(agentMessagesAsUserMessages(input));
+  return stripUnissuedEncryptedReasoning(
+    downgradeOriginalImageDetail(agentMessagesAsUserMessages(input)),
+  );
+}
+
+function applyZenFreeIncludeCompatibility(payload, route) {
+  if (!needsZenFreeToolCompatibility(route)) return payload;
+  const include = stripUnissuedEncryptedReasoningInclude(payload.include);
+  if (include === payload.include) return payload;
+  const next = { ...payload };
+  if (include === undefined) delete next.include;
+  else next.include = include;
+  return next;
 }
 
 function nativeTarget(pathname, search = "") {
@@ -2129,6 +2170,7 @@ async function readVisionEvidence({ url, engine, nativeCall, effort, question, k
 function carryReasoningThroughInput(input, {
   nativeThinking = false,
   removeCarriedReasoning = false,
+  dropReasoning = false,
 } = {}) {
   if (!Array.isArray(input) || input.length < 2) return;
   for (let index = 0; index < input.length - 1; index += 1) {
@@ -2146,7 +2188,19 @@ function carryReasoningThroughInput(input, {
     const text = texts.join("\n");
     const next = input[end];
     let removed = 0;
-    if (text && next) {
+    if (dropReasoning) {
+      // A thinking model on a Chat route that is outside the native-reasoning
+      // contract must not be shown its own past thinking as prose. It reads
+      // the replay as something it once said aloud, moves new thinking into
+      // the answer channel, and loops on its last progress note (#755, and the
+      // Hy4 measurements in chat-reasoning.mjs). Before #708 widened the
+      // reasoning-lifecycle repair to every `openai`-protocol provider these
+      // routes stored no reasoning item at all, so there was nothing to carry
+      // and the path was inert; now there is, and dropping is the only replay
+      // that asserts nothing about a vendor's reasoning_content handling.
+      // The in-contract routes above still carry theirs as `thinking` parts.
+      removed = end - index;
+    } else if (text && next) {
       if (next.type === "function_call" || next.type === "custom_tool_call") {
         input[end - 1] = assistantTextItem(text, nativeThinking);
         if (removeCarriedReasoning) removed = end - index - 1;
@@ -2177,6 +2231,7 @@ function requiresTrailingUserTurn(route) {
   const provider = providerForModel(route);
   if (
     provider?.generic !== true &&
+    provider?.protocol !== "vertex" &&
     (provider?.id === "gemini-api" || provider?.ownedBy?.toLowerCase?.() === "google")
   ) {
     return true;
@@ -2401,6 +2456,30 @@ function sanitizeReasoningForNative(item, { stateless = false } = {}) {
   return storedItem;
 }
 
+// A routed model's reasoning cannot ride into the native backend as reasoning
+// items. Measured against the live backend: `content` is capped at zero parts
+// ("array_above_max_length"), a non-`rs_` id is rejected, an `rs_` id this
+// backend never stored is a 404, and a foreign ciphertext fails to decrypt.
+// Dropping the item throws away thinking the conversation was built on, and
+// moving the text into `summary` keeps the bytes but not the meaning -- a
+// passphrase that appears only in a reasoning summary never reaches the
+// model's answer. Carry the text as a visible assistant message instead: the
+// one replay form that both validates and is actually read. Native items have
+// no visible `content`, so they keep their exact shape and continuation token.
+// `CODEX_ROUTER_NATIVE_REASONING_AS_TEXT=0` restores the old passthrough.
+const NATIVE_REASONING_AS_TEXT =
+  process.env.CODEX_ROUTER_NATIVE_REASONING_AS_TEXT !== "0";
+const NATIVE_REASONING_PREFIX = "[internal reasoning from an earlier turn]";
+
+function nativeReasoningReplay(item) {
+  if (!NATIVE_REASONING_AS_TEXT) return [item];
+  const content = reasoningItemText({ content: item?.content });
+  if (!content) return [item];
+  const summary = reasoningSummaryText(item);
+  const body = summary && summary !== content ? `${summary}\n${content}` : content;
+  return [assistantTextItem(`${NATIVE_REASONING_PREFIX}\n${body}`)];
+}
+
 // The mirror of normalizeRoutedAgentInput. When the parent agent is routed, its
 // turn never touches the native backend, so Codex has no opaque ciphertext to
 // put in a delegated task and stores the payload as plain text under
@@ -2477,7 +2556,7 @@ function normalizeNativeInput(
       const reasoning = sanitizeReasoningForNative(item, {
         stateless: statelessReasoning,
       });
-      return reasoning === undefined ? [] : [reasoning];
+      return reasoning === undefined ? [] : nativeReasoningReplay(reasoning);
     }
     if (
       dropUnstoredReasoningReferences &&
@@ -2678,6 +2757,39 @@ function compactionAttempts(route, aged, searchContract, { allowFailover = true 
   return providerCooldown(route.provider) ? candidates : [route, ...candidates];
 }
 
+function rankCompactionOverflowCandidates({
+  from,
+  aged,
+  searchContract,
+  need,
+  chain,
+}) {
+  return rankFailoverCandidates(
+    selectedConfiguredListedModels().filter(
+      (model) => !readHiddenModels().has(model.slug),
+    ),
+    {
+      from,
+      estimatedTokens: need,
+      needsImage: inputHasImage(aged.input),
+      needsSearch: searchContract.needsSearch,
+      hasSearchHistory: searchContract.hasSearchHistory,
+      requiredSearchMode: searchContract.requiredMode,
+      chain,
+      allowSameFamily: true,
+    },
+  );
+}
+
+function compactionOverflowHops(ranked, { need, tried }) {
+  return ranked
+    .map((entry) => entry.model)
+    .filter(
+      (model) => Number(model.contextWindow) >= need && !tried.has(model.slug),
+    )
+    .slice(0, MAX_FAILOVER_HOPS);
+}
+
 // One compaction attempt against one model. Everything route-dependent lives
 // here so a compaction can be moved to another model exactly like an ordinary
 // turn -- a compaction that fails ends the session just as hard, because the
@@ -2711,7 +2823,7 @@ async function summarizeWith(
     route,
     request,
   );
-  const body = {
+  let body = {
     ...payload,
     model: route.gatewayModel,
     stream: false,
@@ -2729,7 +2841,16 @@ async function summarizeWith(
   normalizeAutoToolChoice(body, route);
   delete body.previous_response_id;
   delete body.client_metadata;
+  // Codex sends reasoning as an object; the ordinary routed turn drops it for
+  // keyless providers because LiteLLM forwards it as a `think` value Ollama
+  // rejects. Compaction spreads the same payload, so it needs the same drop,
+  // or a compaction on a local model fails before any prompt is read.
+  if (providerForModel(route)?.keyless) {
+    delete body.reasoning;
+    delete body.reasoning_effort;
+  }
   applyRoutedServiceTier(body, payload, route);
+  body = applyZenFreeIncludeCompatibility(body, route);
   // Compaction re-enters the same provider as the routed turn. Strict Chat
   // Completions surfaces reject this OpenAI search parameter even though it
   // is unrelated to the compaction body.
@@ -2884,13 +3005,14 @@ async function summarize(request, payload, route, signal, { allowFailover = true
     // metered on its own row exactly as on the turn path -- otherwise a
     // compaction the router rescued would leave no trace of the provider that
     // could not serve it.
+    const bodyText = bytes.toString("utf8");
     failed.push({ route: attemptRoute, status: sent.upstream.status, usage });
     // The first failure is the one reported if every attempt fails: it came
     // from the model the conversation is actually on, which is the one the
     // operator can do something about.
     last ??= {
       ok: false,
-      status: sent.upstream.status,
+      status: gatewayErrorStatus({ status: sent.upstream.status, bodyText }),
       payload: parsed,
       usage,
       toolResultAging: aged.stats,
@@ -2898,9 +3020,45 @@ async function summarize(request, payload, route, signal, { allowFailover = true
     };
     const verdict = classifyRoutedFailure({
       status: sent.upstream.status,
-      bodyText: bytes.toString("utf8"),
+      bodyText,
       retryAfterSeconds: retryAfterSeconds(sent.upstream.headers),
     });
+    const overflow = contextLengthFailure(bodyText);
+    if (overflow && allowFailover && readFailoverSettings().enabled) {
+      const settings = readFailoverSettings();
+      const need = overflow.inputTokens || (Number(attemptRoute.contextWindow) + 1);
+      const tried = new Set([
+        ...attempts.slice(0, index + 1).map((model) => model.slug),
+        ...failed.map((entry) => entry.route.slug),
+      ]);
+      const rankOptions = { from: attemptRoute, aged, searchContract, need };
+      // A named chain is the operator's quota-failover order and is used
+      // verbatim on ordinary turns. Compact overflow still has to find a
+      // window that can hold the prompt: if every chained model is too
+      // small, rank again without the chain so a same-family 1M sibling can
+      // take the compaction. Do not copy this onto turn failover.
+      let hops = compactionOverflowHops(
+        rankCompactionOverflowCandidates({ ...rankOptions, chain: settings.chain }),
+        { need, tried },
+      );
+      if (!hops.length && settings.chain.length) {
+        hops = compactionOverflowHops(
+          rankCompactionOverflowCandidates({ ...rankOptions, chain: [] }),
+          { need, tried },
+        );
+      }
+      if (hops.length) {
+        attempts.splice(index + 1, attempts.length - (index + 1), ...hops);
+        logFailover(
+          attemptRoute,
+          hops[0],
+          "compaction/context_length",
+          sent.upstream.status,
+          "retrying",
+        );
+        continue;
+      }
+    }
     if (!allowFailover) return { ...last, failed };
     if (!verdict.swap) return { ...last, failed };
     recordProviderCooldown(attemptRoute.provider, verdict);
@@ -3001,9 +3159,33 @@ async function handleRoutedCompaction(
     ...(result.failoverFrom ? { failoverFrom: result.failoverFrom } : {}),
   };
   if (!result.ok) {
-    writeJson(response, result.status, result.payload);
-    return {
+    const servedRoute = result.route || route;
+    const provider = providerForModel(servedRoute);
+    const bodyText =
+      typeof result.payload === "string"
+        ? result.payload
+        : JSON.stringify(result.payload ?? {});
+    const translatedStatus = gatewayErrorStatus({
       status: result.status,
+      bodyText,
+    });
+    const translatedError = translateGatewayError({
+      status: result.status,
+      bodyText,
+      modelName: servedRoute.displayName || servedRoute.slug,
+      providerName:
+        provider?.transport === "ollama"
+          ? "Ollama"
+          : provider?.ownedBy || provider?.displayName || servedRoute.provider,
+      providerKind: provider?.kind,
+      providerAuthMode: provider?.authMode,
+    });
+    writeTranslatedGatewayError(response, translatedStatus, translatedError, {
+      provider: servedRoute.provider,
+      stream: payload.stream === true,
+    });
+    return {
+      status: translatedStatus,
       usage: result.usage,
       toolResultAging: result.toolResultAging,
       ...served,
@@ -3253,9 +3435,16 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   // DeepSeek route already has exactly one plaintext reasoning item and must
   // not copy it into an assistant message for Chat translation.
   if (!deepSeekResponses) {
+    // Three replay channels, not two. A Chat route inside the native-reasoning
+    // contract carries its thinking as `thinking` parts for the forwarder to
+    // restore as reasoning_content; a Chat route outside it drops the thinking
+    // rather than replaying it as visible prose (#755); a native Responses
+    // provider keeps its existing item semantics untouched.
+    const nativeChatReasoning = chatCompletionsProvider && usesNativeChatReasoning(route);
     carryReasoningThroughInput(input, {
-      nativeThinking: chatCompletionsProvider && usesNativeChatReasoning(route),
+      nativeThinking: nativeChatReasoning,
       removeCarriedReasoning: chatCompletionsProvider,
+      dropReasoning: chatCompletionsProvider && !nativeChatReasoning,
     });
   }
   // Models marked requiresTrailingUserTurn reject requests ending with a model
@@ -3439,6 +3628,18 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   if (consoleGoResponsesCompatibility || deepSeekResponses) {
     routedToolChoice = flattenToolChoice(routedToolChoice, flattenedNamespaces);
   }
+  if (provider?.protocol === "anthropic") {
+    tools = anthropicFunctionTools(tools);
+    if (
+      routedToolChoice &&
+      typeof routedToolChoice === "object" &&
+      !Array.isArray(routedToolChoice) &&
+      routedToolChoice.type &&
+      !["function", "auto", "none", "required", "allowed_tools"].includes(routedToolChoice.type)
+    ) {
+      routedToolChoice = "auto";
+    }
+  }
   // Last, so the marker text is built from the history every other rewrite has
   // already settled. A chat-wire route would otherwise hand LiteLLM a
   // `web_search_call` it silently discards, and the model answers this turn
@@ -3456,7 +3657,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   // Append V4A examples to the native custom apply_patch description for
   // grok-oauth/grok-4.6 only, before LiteLLM translates that custom tool.
   tools = applyGrokApplyPatchGuidance(tools, route);
-  const routed = {
+  let routed = {
     ...payload,
     tools,
     model: route.gatewayModel,
@@ -3473,6 +3674,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     );
   }
   applyRoutedServiceTier(routed, payload, route);
+  routed = applyZenFreeIncludeCompatibility(routed, route);
   if (routedToolChoice !== payload.tool_choice) routed.tool_choice = routedToolChoice;
   // Codex chooses a child's model; this is where an operator gets to choose its
   // depth. Applied only to turns Codex marked as a child, so a parent
@@ -3843,6 +4045,7 @@ async function handleResponses(request, response, requestUrl) {
   let emptyCompletionUnrepairable = false;
   let emptyCompletionPreludeLimit;
   let preludeLimitRetryable = false;
+  let invalidFunctionCallRetryable = false;
   let finalStatus;
   let activityStatus;
   let usageRecorded = false;
@@ -3898,6 +4101,27 @@ async function handleResponses(request, response, requestUrl) {
     route = registeredRoute && routeProviderEnabled(registeredRoute.provider)
       ? registeredRoute
       : undefined;
+    if (route) {
+      const invalidHistoryCall = findUnusableFunctionCallArguments(payload.input);
+      if (invalidHistoryCall) {
+        writeJson(response, 400, historyFunctionCallArgumentsError(invalidHistoryCall));
+        console.error(
+          `[codex-router] refused invalid function_call arguments model=${route.slug} tool=${
+            invalidHistoryCall.toolName || "unknown"
+          } ${invalidHistoryCall.param || ""} status=400`,
+        );
+        recordObservedUsage({
+          model: route.slug,
+          provider: canonicalProviderId(route.provider),
+          status: 400,
+          durationMs: Date.now() - startedAt,
+        }, diagnostics);
+        usageRecorded = true;
+        finalStatus = 400;
+        activityStatus = 400;
+        return;
+      }
+    }
     if (registeredRoute && !route) {
       writeJson(response, 409, {
         error: {
@@ -4443,6 +4667,15 @@ async function handleResponses(request, response, requestUrl) {
           ),
         );
       }
+      // Refuse a completed function_call whose arguments are not JSON before
+      // Codex can store it. Relaying that item permanently poisons the thread
+      // (#797). After the namespace transform so restored names appear in the
+      // error, and before the empty-completion guard so the completing snapshot
+      // is withheld even if the opening item already counted as content.
+      const invalidFunctionCall = route
+        ? invalidCompletedFunctionCallTransform(flattenedNamespaces, contentType)
+        : undefined;
+      if (invalidFunctionCall) transforms.push(invalidFunctionCall);
       const guard =
         route && EMPTY_COMPLETION_RETRY
           ? new EmptyCompletionGuard(contentType, {
@@ -4535,6 +4768,12 @@ async function handleResponses(request, response, requestUrl) {
                 : "The model exceeded the router's bounded stream parser before producing output.",
           });
         }
+      } else if (
+        isInvalidFunctionCallArgumentsError(error)
+        && !clientGone
+        && nothingRelayed(response)
+      ) {
+        invalidFunctionCallRetryable = true;
       } else {
         throw error;
       }
@@ -4607,7 +4846,7 @@ async function handleResponses(request, response, requestUrl) {
           : "The model streamed reasoning but produced no output. The router could not retry because the response had already started.",
       });
       finalStatus = 502;
-    } else if (emptyCompletion || preludeLimitRetryable) {
+    } else if (emptyCompletion || preludeLimitRetryable || invalidFunctionCallRetryable) {
       // The upstream answered 200 with nothing and never proved otherwise, so
       // the guard still holds every byte. Retry the identical request once:
       // same bytes, same headers, same signal. The discarded first stream means
@@ -4625,6 +4864,11 @@ async function handleResponses(request, response, requestUrl) {
         assertRoutedSearchContract(route, builtSearchMode, searchContract);
       }
       emptyCompletionRetried = true;
+      if (invalidFunctionCallRetryable) {
+        console.error(
+          `[codex-router] invalid function_call arguments; retrying before relay model=${requestedModel || "unknown"} provider=${route?.provider || "unknown"}`,
+        );
+      }
       try {
         const retried = await fetchWithRetry(
           target,
@@ -4883,6 +5127,51 @@ async function handleResponses(request, response, requestUrl) {
           message: "The router canceled a request that exceeded its execution deadline.",
         });
       }
+      return;
+    }
+    if (
+      error?.code === INVALID_FUNCTION_CALL_ARGUMENTS_CODE &&
+      !response.headersSent
+    ) {
+      finalStatus = error.status || 502;
+      activityStatus = finalStatus;
+      writeJson(response, finalStatus, {
+        error: {
+          type: "invalid_request_error",
+          code: error.code,
+          message: error.message,
+          param: error.param ?? null,
+        },
+      });
+      recordObservedUsage({
+        model: route?.slug || requestedModel,
+        provider: route ? canonicalProviderId(route.provider) : "openai",
+        status: finalStatus,
+        durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+      }, diagnostics);
+      usageRecorded = true;
+      return;
+    }
+    if (
+      error?.code === INVALID_FUNCTION_CALL_ARGUMENTS_CODE
+    ) {
+      finalStatus = 502;
+      activityStatus = 502;
+      writeStreamErrorEvent(response, {
+        code: INVALID_FUNCTION_CALL_ARGUMENTS_CODE,
+        message: error.message,
+      });
+      if (!response.writableEnded && !response.destroyed) response.end();
+      recordObservedUsage({
+        model: route?.slug || requestedModel,
+        provider: route ? canonicalProviderId(route.provider) : "openai",
+        status: 502,
+        durationMs: Date.now() - startedAt,
+        responseStartMs: upstreamLatencyMs,
+        streamAborted: true,
+      }, diagnostics);
+      usageRecorded = true;
       return;
     }
     if (
