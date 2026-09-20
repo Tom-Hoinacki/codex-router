@@ -176,6 +176,7 @@ export async function superviseGateway({
   let current = child;
   let restarts = 0;
   const failures = [];
+  let failedStarts = 0;
   const healthMonitored = typeof healthCheck === "function";
 
   for (;;) {
@@ -198,12 +199,13 @@ export async function superviseGateway({
     while (failures.length > 0 && at - failures[0] > windowMs) failures.shift();
 
     const describeExit = `code=${String(exit.code)}, signal=${String(exit.signal)}`;
-    if (maxRestarts <= 0 || failures.length > maxRestarts) {
+    if (maxRestarts <= 0 || failures.length > maxRestarts || failedStarts >= maxRestarts) {
       log(
         maxRestarts <= 0
           ? `${label} exited (${describeExit}); restarts are disabled.`
           : `${label} exited (${describeExit}) after ${failures.length - 1} restart(s) ` +
-            `within ${Math.round(windowMs / 1000)}s; not restarting it again.`,
+            `within ${Math.round(windowMs / 1000)}s; not restarting it again. ` +
+            `Consecutive failed starts: ${failedStarts}.`,
       );
       return { ...exit, restarts, exhausted: true };
     }
@@ -224,7 +226,7 @@ export async function superviseGateway({
       );
       // The process is alive but its listener is not. Stop it and wait for the
       // exit so the replacement can bind the same port.
-      if (isRunning(current)) stop(current);
+      if (isRunning(current)) await stop(current);
       await waitForExit(current, label);
     }
 
@@ -232,13 +234,15 @@ export async function superviseGateway({
     try {
       current = start();
       await waitForHealth(current);
+      failedStarts = 0;
       log(`${label} is healthy again after ${restarts} restart(s).`);
     } catch (error) {
+      failedStarts += 1;
       log(`${label} did not come back: ${reason(error)}.`);
       // A child that is alive but never became healthy would leave the loop
       // parked on a `waitForExit` that resolves only when something else kills
       // it, so end it here and let the next iteration count it.
-      if (isRunning(current)) stop(current);
+      if (isRunning(current)) await stop(current);
     }
   }
 }

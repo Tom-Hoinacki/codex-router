@@ -311,3 +311,37 @@ test("failures outside the window do not count against the bound", async () => {
   assert.equal(result.exhausted, true);
   assert.equal(spawned.length, 6, "the bound did not stop the spawn loop");
 });
+
+
+test("slow failed starts cannot age out the consecutive failure bound", async () => {
+  let clock = 0;
+  const supervisor = harness({
+    limits: { maxRestarts: 2, windowMs: 100, now: () => clock },
+    health: async () => { clock += 101; throw new Error("startup stalled"); },
+  });
+  supervisor.spawned[0].exit(1);
+  const result = await supervisor.done;
+  assert.equal(result.exhausted, true);
+  assert.equal(supervisor.spawned.length, 3);
+});
+
+test("replacement waits for asynchronous tree cleanup, not just launcher exit", async () => {
+  const first = fakeChild(0);
+  let release;
+  let starts = 0;
+  const barrier = new Promise((resolve) => { release = resolve; });
+  const done = superviseGateway({
+    child: first, maxRestarts: 1, healthIntervalMs: 1, healthFailures: 1,
+    backoffMs: 0, log() {}, healthCheck: async () => { throw new Error("dead listener"); },
+    waitForExit: async (child) => child.exitCode !== null || child.signalCode !== null
+      ? { code: child.exitCode, signal: child.signalCode }
+      : new Promise((resolve) => child.resolvers.push(resolve)),
+    stop: async (child) => { child.exit(0); await barrier; },
+    start: () => { starts++; const child = fakeChild(1); child.exit(1); return child; },
+    waitForHealth: async () => {},
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(starts, 0);
+  release(); await done;
+  assert.equal(starts, 1);
+});
