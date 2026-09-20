@@ -25,6 +25,7 @@ import { MODELS } from "./model-registry.mjs";
 import { readLocalModelSelection } from "./local-models.mjs";
 import { antigravityOAuthStartupState } from "./antigravity-oauth-status.mjs";
 import { attemptAntigravityProbePromotionAfterReadiness } from "./antigravity-probe-activation.mjs";
+import { terminateProcessTree } from "./process-tree.mjs";
 import { spawnableCommand } from "./spawnable-command.mjs";
 import { ensureOllamaHeadless } from "./ollama-runtime.mjs";
 import { venvRuntimeProblem } from "./venv-runtime.mjs";
@@ -246,6 +247,7 @@ function run(command, args, extraEnv = {}) {
     cwd: SOURCE_ROOT,
     env: { ...process.env, ...commonEnv, ...extraEnv },
     stdio: "inherit",
+    windowsHide: true,
     ...spawnable.options,
   });
   children.push(child);
@@ -376,7 +378,10 @@ async function main() {
   ]);
 
   const startGateway = () =>
-    run(litellm, [
+    run(usesBundledVenv && process.platform === "win32"
+      ? path.join(SOURCE_ROOT, ".venv", "Scripts", "python.exe") : litellm, [
+      ...(usesBundledVenv && process.platform === "win32"
+        ? [path.join(SOURCE_ROOT, "src", "gateway-entry.py")] : []),
       "--config",
       LITELLM_CONFIG_PATH,
       "--host",
@@ -496,9 +501,13 @@ async function main() {
       start: startGateway,
       waitForExit,
       waitForHealth: gatewayHealthy,
+      stop: async (child) => {
+        if (process.platform === "win32") await terminateProcessTree(child);
+        else child.kill("SIGKILL");
+      },
       healthCheck: gatewayLivenessCheck,
       isShuttingDown: () => shuttingDown,
-      log: (message) => console.error(`[${frontendService}] ${message}`),
+      log: (message) => console.error(`[${frontendService}] ${new Date().toISOString()} ${message}`),
       ...gatewaySupervisorLimits(),
     }),
     waitForExit(router, frontend.label),

@@ -1,3 +1,4 @@
+import { fetchWithGatewayRecovery } from "./gateway-recovery.mjs";
 import { readFileSync } from "node:fs";
 import http from "node:http";
 import { createHash, randomUUID } from "node:crypto";
@@ -366,9 +367,15 @@ function isGrokOauthRoute(route) {
 // A Grok hop uses a pool whose body idle bound outlasts the stall guard. Every
 // other route keeps the shared pool and Undici's default bound.
 function fetchForRoute(route, url, init) {
-  return isGrokOauthRoute(route)
-    ? longIdleStreamFetch(url, init, { bodyTimeoutMs: GROK_TRANSPORT_IDLE_TIMEOUT_MS })
-    : fetch(url, init);
+  const fetchImpl = isGrokOauthRoute(route)
+    ? (target, options) => longIdleStreamFetch(target, options, { bodyTimeoutMs: GROK_TRANSPORT_IDLE_TIMEOUT_MS })
+    : fetch;
+  if (url.startsWith(`${GATEWAY_BASE}/`) && new URL(url).hostname === "127.0.0.1") {
+    return fetchWithGatewayRecovery(url, init, {
+      fetchImpl, healthUrl: new URL("/health/liveliness", GATEWAY_BASE).href,
+    });
+  }
+  return fetchImpl(url, init);
 }
 
 // Codex sends the service tier the operator picked, and a priority tier bills

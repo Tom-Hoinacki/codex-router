@@ -42,8 +42,15 @@ function writeFakeGateway(directory, script) {
     `import { createServer } from "node:http";
 const args = process.argv.slice(2);
 const port = Number(args[args.indexOf("--port") + 1]);
-createServer((request, response) => {
+const server = createServer((request, response) => {
   const url = request.url || "";
+  if (url.startsWith("/wedge")) {
+    response.writeHead(200).end("wedged");
+    server.close();
+    server.closeAllConnections();
+    setInterval(() => {}, 1000);
+    return;
+  }
   if (url.startsWith("/crash") || url.startsWith("/quit")) {
     response.writeHead(200).end("stopping");
     // Exactly what LiteLLM did: the process ends, mid-request, with code 1.
@@ -53,7 +60,7 @@ createServer((request, response) => {
     setTimeout(() => process.exit(url.startsWith("/quit") ? 0 : 1), 10);
     return;
   }
-  response.writeHead(200, { "content-type": "application/json" }).end('{"status":"healthy"}');
+  response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({status:"healthy", pid:process.pid}));
 }).listen(port, "127.0.0.1");
 `,
     { mode: 0o600 },
@@ -159,6 +166,8 @@ test("a ready stack activates its exact pending proof and survives a gateway res
       MODEL_ROUTER_LITELLM_BIN: gatewayBin,
       // Keep the backoff out of the run time; the sequencing is what matters.
       CODEX_ROUTER_GATEWAY_RESTART_BACKOFF_MS: "50",
+      CODEX_ROUTER_GATEWAY_HEALTH_INTERVAL_MS: "100",
+      CODEX_ROUTER_GATEWAY_HEALTH_FAILURES: "1",
       CODEX_ROUTER_HOME: rootDir,
       CODEX_HOME: rootDir,
     },
@@ -190,14 +199,22 @@ test("a ready stack activates its exact pending proof and survives a gateway res
     await waitFor(
       () => errors,
       readExit,
-      /\[codex-router\] LiteLLM gateway exited \(code=1, signal=null\); restarting in 50 ms \(restart 1 of 5\)/,
+      /\[codex-router\] .*LiteLLM gateway exited \(code=1, signal=null\); restarting in 50 ms \(restart 1 of 5\)/,
     );
     assert.match(errors, /The router stays up/);
     await waitFor(
       () => errors,
       readExit,
-      /\[codex-router\] LiteLLM gateway is healthy again after 1 restart\(s\)\./,
+      /\[codex-router\] .*LiteLLM gateway is healthy again after 1 restart\(s\)\./,
     );
+
+    // A living Windows descendant with a closed listener must be retired,
+    // then replaced, without stopping the router or any forwarder.
+    const wedgedPid = JSON.parse((await get(`http://127.0.0.1:${gatewayPort}/health/liveliness`)).body).pid;
+    await get(`http://127.0.0.1:${gatewayPort}/wedge`);
+    await waitFor(() => errors, readExit, /healthy again after 2 restart/);
+    assert.match(errors, /stopped answering health checks/);
+    assert.throws(() => process.kill(wedgedPid, 0), { code: "ESRCH" }, "wedged descendant survived cleanup");
 
     assert.equal(exited, undefined, `the service exited when the gateway crashed:\n${errors}`);
     const health = await get(`http://127.0.0.1:${routerPort}/health`);
